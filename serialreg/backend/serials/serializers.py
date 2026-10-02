@@ -1,8 +1,10 @@
 from django.db import transaction
 from rest_framework import serializers
 
+from . import corrections
 from .models import (
-    Binding, BindingEntry, Issue, IssueNumber, IssueNumbering, Item, Title,
+    Binding, BindingEntry, CorrectionOrder, ExportSnapshot, Issue,
+    IssueNumber, IssueNumbering, Item, Title,
 )
 
 
@@ -171,6 +173,24 @@ class ItemSerializer(serializers.ModelSerializer):
         issue = attrs.get("issue", getattr(self.instance, "issue", None))
         if issue and title and issue.title_id != title.id:
             raise serializers.ValidationError("实物所属刊与发行期不一致。")
+        # 新建入藏时，若该发行期挂着未应用的草稿更正单，给出明确冲突提示
+        # （报失/状态 PATCH 不经过这里的 issue 变更，不受影响）
+        if self.instance is None and issue is not None:
+            from .corrections import CorrectionConflict
+            pending_qs = CorrectionOrder.objects.filter(
+                status=CorrectionOrder.Status.DRAFT,
+                lines__issue=issue,
+            )
+            if pending_qs.exists():
+                refs = "、".join(
+                    f"#{i}" for i in
+                    pending_qs.values_list("id", flat=True).distinct()
+                )
+                raise CorrectionConflict(
+                    f"发行期 #{issue.id} 存在未应用的草稿更正单（{refs}），"
+                    "请先应用或撤回更正单再入藏，避免实物挂在即将变更的关系上。",
+                    code="pending_correction",
+                )
         return attrs
 
 
@@ -206,6 +226,28 @@ class BindingSerializer(serializers.ModelSerializer):
         if already:
             raise serializers.ValidationError(
                 f"实物已在装订册中：{already}，请先拆订。",
+            )
+        # 后续装订冲突提示：实物所属发行期挂着未应用的草稿更正单时，
+        # 不允许先装订——否则装订证据与拟议关系会产生歧义
+        from .corrections import CorrectionConflict
+        rows = CorrectionOrder.objects.filter(
+            status=CorrectionOrder.Status.DRAFT,
+            lines__issue_id__in={it.issue_id for it in deduped},
+        ).values_list("lines__issue_id", "id").distinct()
+        issue_to_orders = {}
+        for issue_id, order_id in rows:
+            issue_to_orders.setdefault(issue_id, set()).add(order_id)
+        if issue_to_orders:
+            issue_ids = sorted(issue_to_orders)
+            order_ids = sorted({oid for ids in issue_to_orders.values() for oid in ids})
+            refs = "、".join(f"#{i}" for i in order_ids)
+            barcodes = [
+                it.barcode for it in deduped if it.issue_id in issue_to_orders
+            ]
+            raise CorrectionConflict(
+                f"实物 {barcodes} 所属发行期 {issue_ids} 存在未应用的草稿更正单"
+                f"（{refs}），请先应用或撤回更正单再装订。",
+                code="pending_correction",
             )
         return deduped
 
@@ -252,3 +294,155 @@ class UnbindSerializer(serializers.Serializer):
         BindingEntry.objects.filter(binding=binding).delete()
         binding.delete()
         return [e.item for e in entries]
+
+
+# ---------- 发行更正单 ----------
+
+class CorrectionLineWriteSerializer(serializers.Serializer):
+    """更正单的一行：针对一个发行期，给拟议月份与拟议覆盖编号。
+
+    number_ids 省略/为 null 表示该行只更正月份、不动编号；
+    issue_month 省略表示只更正编号、不动月份。
+    """
+
+    issue = serializers.PrimaryKeyRelatedField(queryset=Issue.objects.all())
+    kind = serializers.ChoiceField(
+        choices=Issue.IssueKind.choices, required=False, allow_null=True,
+    )
+    issue_month = serializers.DateField(required=False, allow_null=True)
+    issue_month_end = serializers.DateField(required=False, allow_null=True)
+    number_ids = serializers.ListField(
+        child=serializers.IntegerField(), required=False, allow_null=True,
+    )
+    labels = serializers.DictField(required=False)
+
+
+class CorrectionWriteSerializer(serializers.Serializer):
+    title = serializers.PrimaryKeyRelatedField(queryset=Title.objects.all())
+    reason = serializers.CharField(max_length=255)
+    client_ref = serializers.CharField(
+        max_length=64, required=False, allow_blank=True, default="",
+    )
+    lines = CorrectionLineWriteSerializer(many=True)
+
+    def validate_lines(self, lines):
+        if not lines:
+            raise serializers.ValidationError("更正单至少包含一条更正行。")
+        issue_ids = [ln["issue"].id for ln in lines]
+        if len(set(issue_ids)) != len(issue_ids):
+            raise serializers.ValidationError("同一发行期在单内不能出现两次。")
+        return lines
+
+    def validate(self, attrs):
+        title = attrs["title"]
+        for ln in attrs["lines"]:
+            issue = ln["issue"]
+            if issue.title_id != title.id:
+                raise serializers.ValidationError(
+                    {"lines": f"发行期 #{issue.id} 不属于该刊。"},
+                )
+            if ln.get("issue_month") and ln.get("issue_month_end") and (
+                ln["issue_month_end"] < ln["issue_month"]
+            ):
+                raise serializers.ValidationError(
+                    {"lines": f"发行期 #{issue.id} 截止年月不能早于起始年月。"},
+                )
+        return attrs
+
+    def to_proposals(self):
+        out = []
+        raw_lines = []
+        for ln in self.validated_data["lines"]:
+            raw = {"issue": ln["issue"]}
+            if ln.get("kind"):
+                raw["kind"] = ln["kind"]
+            if ln.get("issue_month"):
+                raw["issue_month"] = ln["issue_month"]
+            if "issue_month_end" in ln:
+                raw["issue_month_end"] = ln["issue_month_end"]
+            if ln.get("number_ids") is not None:
+                raw["number_ids"] = ln["number_ids"]
+            if ln.get("labels") is not None:
+                raw["labels"] = ln["labels"]
+            out.append(raw)
+            raw_lines.append(ln)
+        return out, raw_lines
+
+
+class NumberSnapshotSerializer(serializers.Serializer):
+    number_id = serializers.IntegerField(allow_null=True)
+    volume = serializers.CharField()
+    number = serializers.CharField()
+    label = serializers.CharField()
+
+
+class CorrectionSideSerializer(serializers.Serializer):
+    kind = serializers.CharField()
+    issue_month = serializers.DateField()
+    issue_month_end = serializers.DateField(allow_null=True)
+    numbers = NumberSnapshotSerializer(many=True)
+
+
+class CorrectionLineReadSerializer(serializers.Serializer):
+    issue_id = serializers.IntegerField()
+    status = serializers.CharField()
+    version_before = serializers.IntegerField(allow_null=True)
+    version_after = serializers.IntegerField(allow_null=True)
+    before = CorrectionSideSerializer()
+    after = CorrectionSideSerializer()
+
+
+class CorrectionEventSerializer(serializers.Serializer):
+    action = serializers.CharField()
+    detail = serializers.CharField()
+    created_at = serializers.DateTimeField()
+
+
+def order_payload(order):
+    """更正单读模型：头信息 + 每行原/拟议双侧 + 审计事件。"""
+    from .corrections import line_payload
+    lines = (
+        order.lines.prefetch_related("number_snapshots")
+        .select_related("order")
+    )
+    return {
+        "id": order.id,
+        "title": order.title_id,
+        "reason": order.reason,
+        "status": order.status,
+        "client_ref": order.client_ref,
+        "created_at": order.created_at,
+        "applied_at": order.applied_at,
+        "withdrawn_at": order.withdrawn_at,
+        "lines": [
+            {
+                "issue_id": line.issue_id,
+                "status": line.order.status,
+                "version_before": line.version_before,
+                "version_after": line.version_after,
+                "before": line_payload(line)["before"],
+                "after": line_payload(line)["after"],
+            }
+            for line in lines
+        ],
+        "events": [
+            CorrectionEventSerializer(e).data
+            for e in order.events.all()
+        ],
+    }
+
+
+class ExportSnapshotSerializer(serializers.ModelSerializer):
+    """导出/定位证据快照。旧导出永远展示它冻结时的版本。"""
+
+    class Meta:
+        model = ExportSnapshot
+        fields = [
+            "id", "title", "issue", "item", "issue_version", "barcode",
+            "month_start", "month_end", "location", "numbers_json",
+            "created_at",
+        ]
+        read_only_fields = [
+            "issue", "item", "issue_version", "barcode", "month_start",
+            "month_end", "location", "numbers_json",
+        ]

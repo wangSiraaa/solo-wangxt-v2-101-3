@@ -60,4 +60,24 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ binding_id: bindingId }),
     }),
+
+  // 发行更正单
+  listCorrections: (titleId) =>
+    request(`/corrections/?title=${titleId}`),
+  draftCorrection: (payload) =>
+    request("/corrections/", { method: "POST", body: JSON.stringify(payload) }),
+  applyCorrection: (id) =>
+    request(`/corrections/${id}/apply/`, { method: "POST", body: "{}" }),
+  withdrawCorrection: (id) =>
+    request(`/corrections/${id}/withdraw/`, { method: "POST", body: "{}" }),
+  deleteCorrection: (id) =>
+    request(`/corrections/${id}/`, { method: "DELETE" }),
+
+  // 导出快照
+  listExports: (titleId) =>
+    request(titleId ? `/exports/?title=${titleId}` : "/exports/"),
+  freezeExport: (payload) =>
+    request("/exports/freeze/", {
+      method: "POST", body: JSON.stringify(payload),
+    }),
 };

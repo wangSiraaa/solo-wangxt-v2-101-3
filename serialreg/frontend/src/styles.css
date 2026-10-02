@@ -155,6 +155,11 @@ button.tiny { padding: 3px 9px; font-size: 12px; }
 }
 .loc { color: var(--muted); }
 .empty-hint { color: var(--muted); font-size: 12px; font-style: italic; }
+.formerly-hint {
+  color: var(--brand); font-size: 12px; font-style: normal;
+  margin: 4px 0 0; padding: 4px 8px;
+  background: #eef4fc; border-radius: 4px;
+}
 
 .binding-list { margin-top: 10px; }
 .binding-card {
@@ -168,3 +173,34 @@ button.tiny { padding: 3px 9px; font-size: 12px; }
   margin-top: 8px; border-top: 1px dashed var(--line); padding-top: 8px;
 }
 code { background: #eef1f5; padding: 0 4px; border-radius: 4px; font-size: 12px; }
+
+/* 更正单 */
+.badge.pending { background: #fff3df; color: #a35c00; }
+.badge.corrected { background: #e7f0ff; color: #23508f; }
+.correction {
+  margin-top: 6px; border: 1px solid var(--line); border-radius: 6px;
+  background: #fff; padding: 6px 10px;
+}
+.correction.applied { border-color: #b9cdf0; }
+.correction.withdrawn { opacity: .75; }
+.correction summary { cursor: pointer; font-size: 12.5px; }
+.corr-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+  margin-top: 6px;
+}
+.corr-side { font-size: 12px; line-height: 1.7; }
+.corr-side.before { color: var(--muted); }
+.corr-side.after b { color: var(--brand); }
+.corr-times { margin-top: 4px; }
+.correction-card {
+  border: 1px solid var(--line); border-radius: 8px;
+  padding: 8px 12px; margin-bottom: 8px; background: #fff;
+}
+.corr-mini {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+  margin-top: 6px; font-size: 12px;
+}
+.export-line {
+  display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+  font-size: 12px; padding: 4px 6px; border-bottom: 1px dotted var(--line);
+}

@@ -64,6 +64,11 @@
               :timeline="timeline"
               @changed="refresh"
             />
+            <CorrectionPanel
+              :title-id="currentId"
+              :timeline="timeline"
+              @changed="refresh"
+            />
             <BindingPanel
               :title-id="currentId"
               :timeline="timeline"
@@ -83,6 +88,7 @@ import { api } from "./api.js";
 import TimelineView from "./components/TimelineView.vue";
 import LocateBar from "./components/LocateBar.vue";
 import RegisterForms from "./components/RegisterForms.vue";
+import CorrectionPanel from "./components/CorrectionPanel.vue";
 import BindingPanel from "./components/BindingPanel.vue";
 
 const titles = ref([]);

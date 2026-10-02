@@ -95,6 +95,9 @@ class Issue(models.Model):
     )
     note = models.CharField("备注", max_length=255, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    # 投影版本：每应用/撤回一次涉及本期的更正单 +1；导出快照、撤回冲突判定都靠它
+    version = models.PositiveIntegerField("投影版本", default=1)
+    last_corrected_at = models.DateTimeField("最近更正时间", null=True, blank=True)
 
     class Meta:
         verbose_name = "发行期"
@@ -231,12 +234,17 @@ def number_holding_status(title, number):
 
 
 def locate_number(number):
-    """从任一期号找到其所在实物与实际位置（合刊、装订都可命中）。"""
+    """从任一期号找到其所在实物与实际位置（合刊、装订都可命中）。
+
+    更正单应用后，命中关系直接来自更正后的 IssueNumbering 投影；
+    历史关系在 CorrectionNumberSnapshot 里留痕，不参与实时定位。
+    """
     rows = []
     for issue in number.issues.all():
         for item in issue.items.select_related("title"):
             rows.append({
                 "issue_id": issue.id,
+                "issue_version": issue.version,
                 "barcode": item.barcode,
                 "status": item.status,
                 "location": item.current_location(),
@@ -244,3 +252,160 @@ def locate_number(number):
                 "binding": item.binding_entry.binding.call_number if item.is_bound else None,
             })
     return rows
+
+
+class CorrectionOrder(models.Model):
+    """发行更正单：入藏后由编辑部发起的覆盖期号/发行区间更正。
+
+    更正单不原地改写历史：草稿封存原关系与拟议关系；应用时在一个事务里
+    重写 IssueNumbering/月份投影并把 Issue.version+1；撤回（已应用单）则
+    按原关系反向重放。涉及合刊的多条关联随整张单子一起校验、一起提交，
+    任何一条冲突都整张拒绝，不会留下半条关联。
+    """
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", "草稿"
+        APPLIED = "applied", "已应用"
+        WITHDRAWN = "withdrawn", "已撤回"
+
+    title = models.ForeignKey(
+        Title, on_delete=models.CASCADE, related_name="corrections",
+    )
+    reason = models.CharField("更正原因", max_length=255)
+    status = models.CharField(
+        "状态", max_length=10,
+        choices=Status.choices, default=Status.DRAFT, db_index=True,
+    )
+    # 客户端幂等键：同刊内重放同键的提交直接返回旧单，不重复建单
+    client_ref = models.CharField("客户端幂等键", max_length=64, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    applied_at = models.DateTimeField("应用时间", null=True, blank=True)
+    withdrawn_at = models.DateTimeField("撤回时间", null=True, blank=True)
+
+    class Meta:
+        verbose_name = "发行更正单"
+        ordering = ["-created_at", "-id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["title", "client_ref"],
+                condition=~Q(client_ref=""),
+                name="uniq_correction_client_ref_per_title",
+            ),
+        ]
+
+    def __str__(self):
+        return f"更正单#{self.id}（{self.get_status_display()}）"
+
+
+class CorrectionLine(models.Model):
+    """更正单内一条发行期的「原覆盖 → 拟议覆盖」。
+
+    月份在开单时从实时投影快照封存；拟议月份为空表示该行不改月份。
+    合刊期的多个期号仍是多条独立编号快照，事务内整体校验。
+    """
+
+    order = models.ForeignKey(
+        CorrectionOrder, on_delete=models.CASCADE, related_name="lines",
+    )
+    issue = models.ForeignKey(
+        Issue, on_delete=models.PROTECT, related_name="correction_lines",
+        help_text="更正只投影编号与发行区间，发行实体本身不变（实物/装订不断链）",
+    )
+    kind_before = models.CharField("原类型", max_length=10, choices=Issue.IssueKind.choices)
+    kind_after = models.CharField("拟议类型", max_length=10, choices=Issue.IssueKind.choices)
+    month_start_before = models.DateField("原发行起始月")
+    month_end_before = models.DateField("原发行截止月", null=True, blank=True)
+    month_start_after = models.DateField("拟议发行起始月")
+    month_end_after = models.DateField("拟议发行截止月", null=True, blank=True)
+    # 应用/撤回时该 Issue 的版本（version_before 撤回重放时用于乱序冲突判定）
+    version_before = models.PositiveIntegerField("应用前版本", null=True, blank=True)
+    version_after = models.PositiveIntegerField("应用后版本", null=True, blank=True)
+
+    class Meta:
+        verbose_name = "更正行"
+        constraints = [
+            models.UniqueConstraint(fields=["order", "issue"], name="uniq_line_issue_per_order"),
+        ]
+
+
+class CorrectionNumberSnapshot(models.Model):
+    """编号关联快照（去规范化卷期，编号槽位删除后历史仍可还原）。"""
+
+    class Side(models.TextChoices):
+        BEFORE = "before", "原覆盖"
+        AFTER = "after", "拟议覆盖"
+
+    line = models.ForeignKey(
+        CorrectionLine, on_delete=models.CASCADE, related_name="number_snapshots",
+    )
+    side = models.CharField("快照侧", max_length=10, choices=Side.choices)
+    number = models.ForeignKey(
+        IssueNumber, on_delete=models.PROTECT,
+        null=True, blank=True, related_name="correction_snapshots",
+    )
+    # 去规范化：即便编号槽位将来被清理，旧定位证据仍读得到卷/期与封面标识
+    volume = models.CharField("卷（快照）", max_length=20, blank=True)
+    number_label = models.CharField("期（快照）", max_length=20)
+    cover_label = models.CharField("封面标识（快照）", max_length=40, blank=True)
+
+    class Meta:
+        verbose_name = "编号关联快照"
+        ordering = ["id"]
+        indexes = [models.Index(fields=["side"])]
+
+
+class CorrectionEvent(models.Model):
+    """更正单审计事件：每一次状态变迁（含幂等重放）都追加，不覆盖。"""
+
+    class Action(models.TextChoices):
+        CREATE = "create", "开单"
+        UPDATE = "update", "改单"
+        APPLY = "apply", "应用"
+        APPLY_REPLAY = "apply_replay", "重复应用（幂等）"
+        WITHDRAW = "withdraw", "撤回"
+        WITHDRAW_REPLAY = "withdraw_replay", "重复撤回（幂等）"
+        REJECT = "reject", "拒绝"
+
+    order = models.ForeignKey(
+        CorrectionOrder, on_delete=models.CASCADE, related_name="events",
+    )
+    action = models.CharField("动作", max_length=20, choices=Action.choices)
+    detail = models.CharField("说明", max_length=255, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "更正审计事件"
+        ordering = ["created_at", "id"]
+
+
+class ExportSnapshot(models.Model):
+    """导出/定位证据快照：冻结导出那一刻的投影与版本号。
+
+    更正单应用后实时投影变化，但本记录不动；旧导出凭 issue_version
+    与冻结的期号/区间/位置信息永久追溯到更正前的版本。
+    """
+
+    title = models.ForeignKey(
+        Title, on_delete=models.CASCADE, related_name="exports",
+    )
+    issue = models.ForeignKey(
+        Issue, on_delete=models.PROTECT, related_name="exports",
+    )
+    item = models.ForeignKey(
+        Item, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="exports",
+    )
+    issue_version = models.PositiveIntegerField("导出时发行期版本")
+    barcode = models.CharField("条码（快照）", max_length=40, blank=True)
+    month_start = models.DateField("发行起始月（快照）")
+    month_end = models.DateField("发行截止月（快照）", null=True, blank=True)
+    location = models.CharField("实际位置（快照）", max_length=100, blank=True)
+    numbers_json = models.JSONField("期号关系（快照）", default=list)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "导出快照"
+        ordering = ["-created_at", "-id"]
+
+    def __str__(self):
+        return f"导出#{self.id} issue={self.issue_id}@v{self.issue_version}"
