@@ -69,6 +69,15 @@
               :timeline="timeline"
               @changed="refresh"
             />
+            <CorrectionPanel
+              :title-id="currentId"
+              :timeline="timeline"
+              @changed="refresh"
+            />
+            <ExportPanel
+              :title-id="currentId"
+              :timeline="timeline"
+            />
           </div>
         </div>
       </template>
@@ -84,6 +93,8 @@ import TimelineView from "./components/TimelineView.vue";
 import LocateBar from "./components/LocateBar.vue";
 import RegisterForms from "./components/RegisterForms.vue";
 import BindingPanel from "./components/BindingPanel.vue";
+import CorrectionPanel from "./components/CorrectionPanel.vue";
+import ExportPanel from "./components/ExportPanel.vue";
 
 const titles = ref([]);
 const currentId = ref(null);

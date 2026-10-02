@@ -11,9 +11,10 @@
   缺号 = IssueNumber 没有对应 Issue（没有发行记录），不自动等于缺藏；
   缺藏 = 该编号已发行（存在 Issue），但没有入库 Item 或 Item 丢失。
 """
-from django.db import models
+from django.db import models, transaction
 from django.db.models import Q
 from django.core.exceptions import ValidationError
+from django.utils import timezone
 
 
 class Title(models.Model):
@@ -95,6 +96,9 @@ class Issue(models.Model):
     )
     note = models.CharField("备注", max_length=255, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    # 覆盖关系（期号集合 + 发行区间）的版本号：每次应用/撤回更正单 +1。
+    # 已装订、定位证据、导出快照按版本号固化，不能静默覆盖历史。
+    coverage_version = models.PositiveIntegerField("覆盖版本", default=1)
 
     class Meta:
         verbose_name = "发行期"
@@ -237,6 +241,7 @@ def locate_number(number):
         for item in issue.items.select_related("title"):
             rows.append({
                 "issue_id": issue.id,
+                "coverage_version": issue.coverage_version,
                 "barcode": item.barcode,
                 "status": item.status,
                 "location": item.current_location(),
@@ -244,3 +249,433 @@ def locate_number(number):
                 "binding": item.binding_entry.binding.call_number if item.is_bound else None,
             })
     return rows
+
+
+class CorrectionConflict(Exception):
+    """更正流程的领域冲突：乱序、编号被占、存在草稿等。
+
+    由视图层映射为 HTTP 409，与「输入不合法」的 400 区分开。
+    """
+
+    def __init__(self, detail, code="conflict", conflicts=None):
+        super().__init__(detail)
+        self.detail = detail
+        self.code = code
+        self.conflicts = conflicts or []
+
+
+class IssueCorrection(models.Model):
+    """发行更正单：对一次发行（Issue）的覆盖期号与发行区间的拟议更正。
+
+    更正单不就地抹掉历史：原覆盖关系保存在 original_line_set 快照里，
+    拟议关系保存在 correction_line_set；应用时才改写 Issue 的现行投影，
+    并把 Issue.coverage_version 推进。撤回时凭 original_* 快照还原。
+    合刊的多条期号关联属于同一张更正单，校验与应用是一个事务。
+    """
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", "草稿"
+        APPLIED = "applied", "已应用"
+        WITHDRAWN = "withdrawn", "已撤回"
+
+    issue = models.ForeignKey(
+        Issue, on_delete=models.PROTECT,
+        related_name="corrections",
+        help_text="被更正的发行实体；实体身份与装订/条码关系不随更正改变",
+    )
+    status = models.CharField(
+        "状态", max_length=10, choices=Status.choices, default=Status.DRAFT,
+    )
+    reason = models.CharField("更正原因", max_length=255)
+    # 拟议发行区间（应用后写入 Issue；行级数据里不再存月份）
+    proposed_issue_month = models.DateField("拟议发行年月")
+    proposed_issue_month_end = models.DateField(
+        "拟议发行截止年月", null=True, blank=True,
+    )
+    # 应用前快照：即使撤回/再应用，也能还原「应用前内容」
+    original_numbers = models.JSONField(
+        "原覆盖编号快照", default=list,
+        help_text="[{number_id, volume, number, label}, ...]",
+    )
+    original_issue_month = models.DateField("原发行年月", null=True, blank=True)
+    original_issue_month_end = models.DateField(
+        "原发行截止年月", null=True, blank=True,
+    )
+    applied_issue_version = models.PositiveIntegerField(
+        "应用时版本", null=True, blank=True,
+        help_text="本次更正应用后 Issue 的 coverage_version",
+    )
+    withdrawn_issue_version = models.PositiveIntegerField(
+        "撤回后版本", null=True, blank=True,
+    )
+    # 乐观锁/乱序检测：每次状态推进 +1；客户端必须带回它看到的版本
+    version = models.PositiveIntegerField("更正单版本", default=1)
+    # 幂等令牌：同一业务意图（含「重复点击」）只落一张单/一次状态变更
+    client_token = models.CharField(
+        "幂等令牌", max_length=64, unique=True, null=True, blank=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    applied_at = models.DateTimeField(null=True, blank=True)
+    withdrawn_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        verbose_name = "发行更正单"
+        ordering = ["-created_at", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["issue"],
+                condition=Q(status="draft"),
+                name="uniq_draft_correction_per_issue",
+            ),
+        ]
+
+    def __str__(self):
+        return f"更正单#{self.id}（Issue {self.issue_id}，{self.get_status_display()}）"
+
+
+class CorrectionLine(models.Model):
+    """更正单行：一对（原编号, 拟议编号）。拟议编号可空，表示该覆盖被撤销。
+
+    合刊一行一条，随整张更正单一起校验/应用/撤回——不存在半条关联。
+    number 用 PROTECT：编号一旦进入更正历史就不能删除，以保证可还原。
+    """
+
+    correction = models.ForeignKey(
+        IssueCorrection, on_delete=models.CASCADE, related_name="lines",
+    )
+    original_number = models.ForeignKey(
+        IssueNumber, on_delete=models.PROTECT,
+        related_name="correction_original_lines", null=True, blank=True,
+    )
+    proposed_number = models.ForeignKey(
+        IssueNumber, on_delete=models.PROTECT,
+        related_name="correction_proposed_lines", null=True, blank=True,
+    )
+    proposed_label = models.CharField(
+        "拟议封面标识", max_length=40, blank=True,
+    )
+    seq = models.PositiveIntegerField("行序", default=0)
+
+    class Meta:
+        ordering = ["seq", "id"]
+
+
+class CorrectionEvent(models.Model):
+    """更正单状态机审计：创建、修改、应用、撤回（含幂等重放/乱序拒绝）。"""
+
+    class Action(models.TextChoices):
+        CREATE = "create", "创建草稿"
+        UPDATE = "update", "修改草稿"
+        APPLY = "apply", "应用"
+        REAPPLY = "reapply", "重复应用（幂等）"
+        WITHDRAW = "withdraw", "撤回"
+        REWITHDRAW = "rewithdraw", "重复撤回（幂等）"
+        REJECT = "reject", "乱序/冲突拒绝"
+
+    correction = models.ForeignKey(
+        IssueCorrection, on_delete=models.CASCADE, related_name="events",
+    )
+    action = models.CharField(max_length=12, choices=Action.choices)
+    detail = models.CharField("说明", max_length=255, blank=True)
+    expected_version = models.PositiveIntegerField(null=True, blank=True)
+    issue_version_after = models.PositiveIntegerField(null=True, blank=True)
+    actor = models.CharField("操作人", max_length=64, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+
+
+class ExportRecord(models.Model):
+    """导出/书目上报记录：导出瞬间冻结覆盖关系快照与当时的版本号。
+
+    之后无论更正应用还是撤回，快照内容不再改变——旧导出永远能追溯到
+    它导出时那个版本的投影（历史装订记录与定位证据同理）。
+    """
+
+    title = models.ForeignKey(
+        Title, on_delete=models.CASCADE, related_name="export_records",
+    )
+    issue = models.ForeignKey(
+        Issue, on_delete=models.PROTECT, related_name="export_records",
+    )
+    coverage_version = models.PositiveIntegerField("导出时覆盖版本")
+    correction = models.ForeignKey(
+        IssueCorrection, on_delete=models.SET_NULL,
+        related_name="export_records", null=True, blank=True,
+        help_text="导出时生效的更正单（无则为原始发行关系）",
+    )
+    snapshot = models.JSONField("覆盖关系快照", default=dict)
+    note = models.CharField("备注", max_length=255, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "导出记录"
+        ordering = ["-created_at", "id"]
+
+
+# ---------- 更正领域服务 ----------
+
+def build_coverage_snapshot(issue):
+    """冻结一个 Issue 当前的覆盖投影：期号行 + 发行区间 + 版本号。"""
+    return {
+        "issue_id": issue.id,
+        "kind": issue.kind,
+        "issue_month": issue.issue_month.isoformat() if issue.issue_month else None,
+        "issue_month_end": (
+            issue.issue_month_end.isoformat() if issue.issue_month_end else None
+        ),
+        "coverage_version": issue.coverage_version,
+        "numbers": [
+            {
+                "number_id": nn.number_id,
+                "volume": nn.number.volume,
+                "number": nn.number.number,
+                "label": nn.label,
+            }
+            for nn in IssueNumbering.objects.filter(issue=issue)
+            .select_related("number").order_by("id")
+        ],
+    }
+
+
+def latest_applied_correction(issue):
+    """该发行当前生效的更正单（已应用且未撤回）；没有则 None。"""
+    return (
+        IssueCorrection.objects.filter(issue=issue, status=IssueCorrection.Status.APPLIED)
+        .order_by("-applied_at", "-id")
+        .first()
+    )
+
+
+def pending_correction(issue):
+    """阻断后续入藏/装订的草稿更正单。"""
+    return (
+        IssueCorrection.objects.filter(issue=issue, status=IssueCorrection.Status.DRAFT)
+        .first()
+    )
+
+
+def assert_no_pending_correction(issue, action="入藏或装订"):
+    corr = pending_correction(issue)
+    if corr is not None:
+        raise CorrectionConflict(
+            f"该发行期存在未决更正单 #{corr.id}（{corr.reason}），"
+            f"请先应用或撤回后再{action}。",
+            code="pending_correction",
+            conflicts=[{"correction_id": corr.id, "reason": corr.reason}],
+        )
+
+
+def validate_proposed_coverage(issue, proposed_number_ids, start, end):
+    """整张更正单的覆盖校验（合刊多行作为一个整体）。
+
+    返回去重后的拟议编号列表。任何一条不合法都不允许应用/落单，
+    避免「静默把编号挪给别的发行期」。
+    """
+    if not proposed_number_ids:
+        raise CorrectionConflict(
+            "更正后至少保留一个覆盖期号；如整期作废请走停刊/注销流程。",
+            code="empty_coverage",
+        )
+    if len(set(proposed_number_ids)) != len(proposed_number_ids):
+        raise CorrectionConflict("拟议期号不能重复。", code="duplicate_number")
+    numbers = list(
+        IssueNumber.objects.filter(id__in=set(proposed_number_ids))
+    )
+    if len(numbers) != len(set(proposed_number_ids)):
+        raise CorrectionConflict("拟议期号中有未登记的编号。", code="unknown_number")
+    wrong = [n.id for n in numbers if n.title_id != issue.title_id]
+    if wrong:
+        raise CorrectionConflict(
+            f"期号 {wrong} 不属于该刊。", code="wrong_title",
+        )
+    # 一个编号槽位只能被一次发行覆盖：被其他 Issue 占用即整单拒绝
+    occupied = list(
+        IssueNumbering.objects.filter(number__in=numbers)
+        .exclude(issue_id=issue.id)
+        .values_list("number__volume", "number__number", "issue_id")
+    )
+    if occupied:
+        raise CorrectionConflict(
+            f"拟议期号已被其他发行期占用：{occupied}；整张更正单被拒绝。",
+            code="number_occupied",
+            conflicts=[{"volume": v, "number": n, "issue_id": i}
+                       for v, n, i in occupied],
+        )
+    # 合刊/普通期的形态约束保持不变
+    if issue.kind == Issue.IssueKind.COMBINED and len(numbers) < 2:
+        raise CorrectionConflict("合刊更正后仍须覆盖至少两个期号。", code="combined_shrunk")
+    if issue.kind == Issue.IssueKind.REGULAR and len(numbers) != 1:
+        raise CorrectionConflict("普通期更正后只能覆盖一个期号。", code="regular_expanded")
+    if end and start and end < start:
+        raise CorrectionConflict("拟议截止年月不能早于起始年月。", code="bad_range")
+    return numbers
+
+
+def _log_event(correction, action, detail="", expected_version=None,
+               issue_version_after=None):
+    return CorrectionEvent.objects.create(
+        correction=correction, action=action, detail=detail,
+        expected_version=expected_version,
+        issue_version_after=issue_version_after,
+    )
+
+
+@transaction.atomic()
+def apply_correction(correction, expected_version=None, actor=""):
+    """应用更正单（幂等）。
+
+    重复应用：不再改变任何关系，只记 REAPPLY 审计；
+    乱序（expected_version 与现行版本不符）：抛 409 且不改数据；
+    已撤回/编号此时被占：整单拒绝，编号关系维持原状。
+    """
+    corr = IssueCorrection.objects.select_for_update().get(pk=correction.pk)
+    issue = Issue.objects.select_for_update().get(pk=corr.issue_id)
+
+    if expected_version is not None and expected_version != corr.version:
+        _log_event(
+            corr, CorrectionEvent.Action.REJECT,
+            f"乱序应用：客户端版本 {expected_version}，现行版本 {corr.version}",
+            expected_version, issue.coverage_version,
+        )
+        raise CorrectionConflict(
+            f"更正单已过期：客户端版本 {expected_version}，现行版本 {corr.version}，"
+            "请刷新后重试。",
+            code="stale_version",
+        )
+
+    if corr.status == IssueCorrection.Status.APPLIED:
+        _log_event(
+            corr, CorrectionEvent.Action.REAPPLY,
+            "重复应用，关系不变", expected_version, issue.coverage_version,
+        )
+        return corr, False
+
+    if corr.status == IssueCorrection.Status.WITHDRAWN:
+        raise CorrectionConflict(
+            f"更正单 #{corr.id} 已撤回，不能应用；请新建更正单。",
+            code="already_withdrawn",
+        )
+
+    lines = list(corr.lines.all())
+    proposed_ids = [
+        ln.proposed_number_id for ln in lines if ln.proposed_number_id is not None
+    ]
+    # 应用前再校验一次（草稿期间可能已有新发行占用了拟议编号）
+    validate_proposed_coverage(
+        issue, proposed_ids,
+        corr.proposed_issue_month, corr.proposed_issue_month_end,
+    )
+
+    # 改写现行投影：先删后建，全部在同一事务里，失败不留半条关联
+    IssueNumbering.objects.filter(issue=issue).delete()
+    IssueNumbering.objects.bulk_create([
+        IssueNumbering(
+            issue=issue, number_id=ln.proposed_number_id,
+            label=ln.proposed_label or "",
+        )
+        for ln in lines if ln.proposed_number_id is not None
+    ])
+    issue.issue_month = corr.proposed_issue_month
+    issue.issue_month_end = corr.proposed_issue_month_end
+    issue.coverage_version += 1
+    issue.save(update_fields=[
+        "issue_month", "issue_month_end", "coverage_version",
+    ])
+
+    corr.status = IssueCorrection.Status.APPLIED
+    corr.version += 1
+    corr.applied_at = timezone.now()
+    corr.applied_issue_version = issue.coverage_version
+    corr.save(update_fields=[
+        "status", "version", "applied_at", "applied_issue_version", "updated_at",
+    ])
+    _log_event(
+        corr, CorrectionEvent.Action.APPLY,
+        f"应用后覆盖版本 v{issue.coverage_version}",
+        expected_version, issue.coverage_version,
+    )
+    return corr, True
+
+
+@transaction.atomic()
+def withdraw_correction(correction, expected_version=None, actor=""):
+    """撤回更正单（仅最新生效的那张可撤回），凭 original_* 快照还原。
+
+    重复撤回幂等；撤回时若原编号已被其他发行期占用（更正后又入藏新刊），
+    整单拒绝，现行投影保持不动。
+    """
+    corr = IssueCorrection.objects.select_for_update().get(pk=correction.pk)
+    issue = Issue.objects.select_for_update().get(pk=corr.issue_id)
+
+    if expected_version is not None and expected_version != corr.version:
+        _log_event(
+            corr, CorrectionEvent.Action.REJECT,
+            f"乱序撤回：客户端版本 {expected_version}，现行版本 {corr.version}",
+            expected_version, issue.coverage_version,
+        )
+        raise CorrectionConflict(
+            f"更正单已过期：客户端版本 {expected_version}，现行版本 {corr.version}，"
+            "请刷新后重试。",
+            code="stale_version",
+        )
+
+    if corr.status == IssueCorrection.Status.WITHDRAWN:
+        _log_event(
+            corr, CorrectionEvent.Action.REWITHDRAW,
+            "重复撤回，关系不变", expected_version, issue.coverage_version,
+        )
+        return corr, False
+
+    if corr.status == IssueCorrection.Status.DRAFT:
+        raise CorrectionConflict(
+            "草稿更正单不能撤回；请直接修改或删除。", code="draft_withdraw",
+        )
+
+    # 只允许撤回最后生效的更正，防止乱序还原
+    later = IssueCorrection.objects.filter(
+        issue=issue, status=IssueCorrection.Status.APPLIED,
+    ).exclude(pk=corr.pk).exists()
+    if later:
+        raise CorrectionConflict(
+            f"更正单 #{corr.id} 之后还有更新的已应用更正，"
+            "请先撤回最新的更正单。",
+            code="not_latest",
+        )
+
+    original_ids = [row["number_id"] for row in (corr.original_numbers or [])]
+    validate_proposed_coverage(
+        issue, original_ids,
+        corr.original_issue_month, corr.original_issue_month_end,
+    )
+
+    IssueNumbering.objects.filter(issue=issue).delete()
+    IssueNumbering.objects.bulk_create([
+        IssueNumbering(
+            issue=issue, number_id=row["number_id"], label=row.get("label", ""),
+        )
+        for row in (corr.original_numbers or [])
+    ])
+    issue.issue_month = corr.original_issue_month
+    issue.issue_month_end = corr.original_issue_month_end
+    issue.coverage_version += 1
+    issue.save(update_fields=[
+        "issue_month", "issue_month_end", "coverage_version",
+    ])
+
+    corr.status = IssueCorrection.Status.WITHDRAWN
+    corr.version += 1
+    corr.withdrawn_at = timezone.now()
+    corr.withdrawn_issue_version = issue.coverage_version
+    corr.save(update_fields=[
+        "status", "version", "withdrawn_at", "withdrawn_issue_version",
+        "updated_at",
+    ])
+    _log_event(
+        corr, CorrectionEvent.Action.WITHDRAW,
+        f"撤回还原至覆盖版本 v{issue.coverage_version}",
+        expected_version, issue.coverage_version,
+    )
+    return corr, True

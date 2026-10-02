@@ -60,4 +60,37 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ binding_id: bindingId }),
     }),
+
+  // 发行更正单
+  listCorrections: (titleId) =>
+    request(`/corrections/?title=${titleId}`),
+  createCorrection: (payload) =>
+    request("/corrections/", { method: "POST", body: JSON.stringify(payload) }),
+  updateCorrection: (id, payload) =>
+    request(`/corrections/${id}/`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
+  deleteCorrection: (id) =>
+    request(`/corrections/${id}/`, { method: "DELETE" }),
+  applyCorrection: (id, expectedVersion) =>
+    request(`/corrections/${id}/apply/`, {
+      method: "POST",
+      body: JSON.stringify(
+        expectedVersion == null ? {} : { expected_version: expectedVersion },
+      ),
+    }),
+  withdrawCorrection: (id, expectedVersion) =>
+    request(`/corrections/${id}/withdraw/`, {
+      method: "POST",
+      body: JSON.stringify(
+        expectedVersion == null ? {} : { expected_version: expectedVersion },
+      ),
+    }),
+
+  // 导出记录（快照冻结，不可修改）
+  listExports: (titleId) =>
+    request(`/exports/?title=${titleId}`),
+  createExport: (payload) =>
+    request("/exports/", { method: "POST", body: JSON.stringify(payload) }),
 };

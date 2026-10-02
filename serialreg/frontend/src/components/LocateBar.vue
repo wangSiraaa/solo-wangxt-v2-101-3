@@ -27,6 +27,14 @@
         </span>
         <span class="muted">{{ meta(result.holding_status).hint }}</span>
       </div>
+      <p
+        v-for="pc in result.pending_corrections || []"
+        :key="pc.correction_id"
+        class="msg err"
+      >
+        ⚠ 该期存在未决更正单 #{{ pc.correction_id }}：{{ pc.reason }}
+        —— 应用或撤回前，新的入藏/装订与现行投影可能不一致，已被暂停。
+      </p>
       <p v-if="result.matches.length === 0" class="empty-hint">
         定位不到任何实物。若状态为「缺号」，表示没有发行记录，并非自动判定缺藏。
       </p>
